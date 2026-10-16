@@ -1,430 +1,490 @@
 // lib/proposals.ts
 //
-// Service layer for proposal operations and the atomic
-// proposal-acceptance → contract-creation flow.
+// Service layer for the Proposal Management API (issue #216).
 //
-// All DB access goes through this module so route handlers stay thin and
-// the logic is independently unit-testable.  The acceptance flow runs
-// inside a single BEGIN/COMMIT block to guarantee atomicity: if any step
-// fails, the entire transaction rolls back and no partial state is left.
-//
-// Column mapping: DB snake_case ←→ JS camelCase (done manually — no ORM).
+// Route handlers in app/api/projects/[id]/proposals and app/api/proposals/[id]
+// stay thin: validation schemas, the status state machine, the response
+// envelope and all SQL live here.
 
-import { neon } from '@neondatabase/serverless'
+import { NextRequest, NextResponse } from "next/server";
+import { z } from "zod";
+import { sql } from "@/lib/db";
+import { cacheGet, cacheSet } from "@/lib/cache";
+import { readAccessToken, verifyAccessToken } from "@/lib/auth/session";
+import type { AuthContext } from "@/lib/auth/middleware";
 
-// ─── Types ────────────────────────────────────────────────────────────────
+// ─── Status lifecycle ───────────────────────────────────────────────────────
 
-export type ProposalStatus = 'pending' | 'accepted' | 'rejected' | 'withdrawn'
+export const PROPOSAL_STATUSES = [
+  "submitted",
+  "under_review",
+  "accepted",
+  "rejected",
+  "updated",
+] as const;
 
-/** A single milestone entry inside proposal.milestoneBreakdown */
+export type ProposalStatus = (typeof PROPOSAL_STATUSES)[number];
+
+/**
+ * Allowed status transitions. Anything not listed is blocked with 409.
+ *
+ *   submitted / updated ──► under_review ──► accepted | rejected
+ *        │    ▲                  │
+ *        │    └── freelancer edit (→ updated) ◄┘
+ *        └──────────────────────────────────► accepted | rejected
+ *
+ * `accepted` and `rejected` are terminal.
+ */
+export const PROPOSAL_TRANSITIONS: Record<ProposalStatus, readonly ProposalStatus[]> = {
+  submitted: ["under_review", "updated", "accepted", "rejected"],
+  updated: ["under_review", "updated", "accepted", "rejected"],
+  under_review: ["updated", "accepted", "rejected"],
+  accepted: [],
+  rejected: [],
+};
+
+export function canTransition(from: ProposalStatus, to: ProposalStatus): boolean {
+  return PROPOSAL_TRANSITIONS[from]?.includes(to) ?? false;
+}
+
+/** A proposal is still "under review" (editable) until it is accepted/rejected. */
+export function isEditable(status: ProposalStatus): boolean {
+  return status === "submitted" || status === "under_review" || status === "updated";
+}
+
+// ─── Response envelope ──────────────────────────────────────────────────────
+// Every endpoint returns { success, data, errors } (acceptance criterion).
+
+export interface ApiError {
+  code: string;
+  message: string;
+  field?: string;
+}
+
+export function ok<T>(data: T, status = 200): NextResponse {
+  return NextResponse.json({ success: true, data, errors: null }, { status });
+}
+
+export function fail(status: number, errors: ApiError[]): NextResponse {
+  return NextResponse.json({ success: false, data: null, errors }, { status });
+}
+
+export function failOne(status: number, code: string, message: string): NextResponse {
+  return fail(status, [{ code, message }]);
+}
+
+/**
+ * Same token checks as withAuthCtx in lib/auth/middleware, but the 401 uses
+ * the { success, data, errors } envelope so every proposal endpoint responds
+ * in one consistent shape.
+ */
+export function withProposalAuth<Ctx>(
+  handler: (req: NextRequest, auth: AuthContext, context: Ctx) => Promise<NextResponse>,
+) {
+  return async (req: NextRequest, context: Ctx): Promise<NextResponse> => {
+    const token = readAccessToken(req);
+    const payload = token ? verifyAccessToken(token) : null;
+    if (!payload) {
+      return failOne(401, "AUTH_REQUIRED", "Authentication is required");
+    }
+    return handler(req, { walletAddress: payload.walletAddress, tokenJti: payload.jti }, context);
+  };
+}
+
+/** Flattens a ZodError into field-level error entries with clear messages. */
+export function zodErrors(error: z.ZodError): ApiError[] {
+  return error.issues.map((issue) => ({
+    code: "VALIDATION_ERROR",
+    message: issue.message,
+    field: issue.path.length ? issue.path.join(".") : undefined,
+  }));
+}
+
+// ─── Validation schemas (Zod) ───────────────────────────────────────────────
+
+export const UUIDSchema = z.string().uuid();
+
+const MilestoneSchema = z.object({
+  title: z
+    .string({ required_error: "milestone title is required" })
+    .trim()
+    .min(1, "milestone title cannot be empty")
+    .max(200, "milestone title must be 200 characters or fewer"),
+  description: z
+    .string()
+    .max(1000, "milestone description must be 1000 characters or fewer")
+    .optional(),
+  amount: z
+    .number({ invalid_type_error: "milestone amount must be a number" })
+    .positive("milestone amount must be a positive number"),
+  dueInDays: z
+    .number()
+    .int("milestone dueInDays must be an integer")
+    .positive("milestone dueInDays must be a positive integer")
+    .optional(),
+});
+
+const messageField = z
+  .string({ required_error: "message is required", invalid_type_error: "message must be a string" })
+  .trim()
+  .min(20, "message must be at least 20 characters")
+  .max(5000, "message must be 5000 characters or fewer");
+
+const budgetField = z
+  .number({ required_error: "budget is required", invalid_type_error: "budget must be a number" })
+  .positive("budget must be a positive number")
+  .max(1_000_000_000, "budget is too large");
+
+const deliveryTimeField = z
+  .number({
+    required_error: "deliveryTime is required",
+    invalid_type_error: "deliveryTime must be a number of days",
+  })
+  .int("deliveryTime must be a whole number of days")
+  .min(1, "deliveryTime must be at least 1 day")
+  .max(3650, "deliveryTime must be 3650 days or fewer");
+
+const milestonesField = z
+  .array(MilestoneSchema)
+  .max(20, "a proposal can have at most 20 milestones");
+
+/** Milestone amounts must not add up to more than the proposed budget. */
+function milestonesWithinBudget(budget?: number, milestones?: { amount: number }[]): boolean {
+  if (budget === undefined || !milestones?.length) return true;
+  const total = milestones.reduce((sum, m) => sum + m.amount, 0);
+  // Small epsilon guards against floating point noise on decimal amounts.
+  return total <= budget + 1e-9;
+}
+
+export const CreateProposalSchema = z
+  .object({
+    message: messageField,
+    budget: budgetField,
+    deliveryTime: deliveryTimeField,
+    milestones: milestonesField.optional(),
+  })
+  .strict()
+  .refine((d) => milestonesWithinBudget(d.budget, d.milestones), {
+    message: "milestone amounts cannot exceed the proposal budget",
+    path: ["milestones"],
+  });
+
+export type CreateProposalInput = z.infer<typeof CreateProposalSchema>;
+
+/**
+ * PATCH body. Content fields are for the owning freelancer; `status` is for
+ * the project's client (review decisions). Mixing both is rejected so each
+ * request has exactly one actor.
+ */
+export const UpdateProposalSchema = z
+  .object({
+    message: messageField.optional(),
+    budget: budgetField.optional(),
+    deliveryTime: deliveryTimeField.optional(),
+    milestones: milestonesField.optional(),
+    status: z
+      .enum(["under_review", "accepted", "rejected"], {
+        errorMap: () => ({ message: "status must be one of: under_review, accepted, rejected" }),
+      })
+      .optional(),
+  })
+  .strict()
+  .refine((d) => Object.keys(d).length > 0, {
+    message: "At least one field must be provided for an update",
+  })
+  .refine(
+    (d) =>
+      d.status === undefined ||
+      (d.message === undefined &&
+        d.budget === undefined &&
+        d.deliveryTime === undefined &&
+        d.milestones === undefined),
+    { message: "status cannot be changed in the same request as proposal content", path: ["status"] },
+  );
+
+export type UpdateProposalInput = z.infer<typeof UpdateProposalSchema>;
+
+export const ListProposalsQuerySchema = z.object({
+  status: z
+    .enum(PROPOSAL_STATUSES, {
+      errorMap: () => ({ message: `status must be one of: ${PROPOSAL_STATUSES.join(", ")}` }),
+    })
+    .optional(),
+  page: z.coerce.number().int("page must be an integer").min(1, "page must be at least 1").default(1),
+  pageSize: z.coerce
+    .number()
+    .int("pageSize must be an integer")
+    .min(1, "pageSize must be at least 1")
+    .max(100, "pageSize must be 100 or fewer")
+    .default(20),
+});
+
+// ─── Domain types & row mapping ─────────────────────────────────────────────
+
 export interface ProposalMilestone {
-  title: string
-  description?: string
-  amount: number
-  due_date?: string // ISO-8601 date string, optional
+  title: string;
+  description?: string;
+  amount: number;
+  dueInDays?: number;
 }
 
 export interface Proposal {
-  id: string
-  projectId: string
-  freelancerId: string
-  coverLetter: string
-  proposedAmount: number
-  currency: string
-  estimatedDuration: string | null
-  milestoneBreakdown: ProposalMilestone[]
-  status: ProposalStatus
-  contractId: string | null
-  acceptedAt: string | null
-  rejectedAt: string | null
-  createdAt: string
-  updatedAt: string
+  id: string;
+  projectId: string;
+  freelancerId: string;
+  message: string;
+  budget: number;
+  deliveryTime: number;
+  milestones: ProposalMilestone[];
+  status: ProposalStatus;
+  createdAt: string;
+  updatedAt: string;
 }
 
-export interface AcceptProposalResult {
-  proposal: Proposal
-  contract: {
-    id: string
-    projectId: string
-    clientId: string
-    freelancerId: string
-    status: string
-    escrowStatus: string
-    totalAmount: number
-    currency: string
-    proposalId: string
-    createdAt: string
-    updatedAt: string
-  }
-  milestones: Array<{
-    id: string
-    contractId: string
-    projectId: string
-    title: string
-    description: string | null
-    amount: number
-    currency: string
-    dueDate: string | null
-    sortOrder: number
-    status: string
-    createdAt: string
-  }>
+function toIso(value: unknown): string {
+  return value instanceof Date ? value.toISOString() : String(value);
 }
 
-// ─── Errors ───────────────────────────────────────────────────────────────
-
-export class ProposalNotFoundError extends Error {
-  constructor(proposalId: string) {
-    super(`Proposal ${proposalId} not found`)
-    this.name = 'ProposalNotFoundError'
-  }
-}
-
-export class ProposalAlreadyAcceptedError extends Error {
-  constructor(proposalId: string) {
-    super(`Proposal ${proposalId} has already been accepted`)
-    this.name = 'ProposalAlreadyAcceptedError'
-  }
-}
-
-export class ProposalNotPendingError extends Error {
-  constructor(status: string) {
-    super(`Proposal cannot be accepted from status '${status}'`)
-    this.name = 'ProposalNotPendingError'
-  }
-}
-
-export class ProjectAlreadyContractedError extends Error {
-  constructor(projectId: string) {
-    super(`Project ${projectId} already has an accepted proposal`)
-    this.name = 'ProjectAlreadyContractedError'
-  }
-}
-
-export class ProjectNotActiveError extends Error {
-  constructor(status: string) {
-    super(`Project cannot accept proposals in status '${status}'`)
-    this.name = 'ProjectNotActiveError'
-  }
-}
-
-export class UnauthorizedAcceptanceError extends Error {
-  constructor() {
-    super('Only the project client can accept a proposal')
-    this.name = 'UnauthorizedAcceptanceError'
-  }
-}
-
-// ─── Helpers ──────────────────────────────────────────────────────────────
-
-function rowToProposal(row: Record<string, unknown>): Proposal {
+export function rowToProposal(row: Record<string, unknown>): Proposal {
+  const rawMilestones = row.milestones;
+  const milestones =
+    typeof rawMilestones === "string"
+      ? (JSON.parse(rawMilestones) as ProposalMilestone[])
+      : ((rawMilestones as ProposalMilestone[] | null) ?? []);
   return {
-    id: row.id as string,
-    projectId: row.project_id as string,
-    freelancerId: row.freelancer_id as string,
-    coverLetter: row.cover_letter as string,
-    proposedAmount: Number(row.proposed_amount),
-    currency: row.currency as string,
-    estimatedDuration: (row.estimated_duration as string | null) ?? null,
-    milestoneBreakdown: (row.milestone_breakdown as ProposalMilestone[]) ?? [],
+    id: String(row.id),
+    projectId: String(row.project_id),
+    freelancerId: String(row.freelancer_id),
+    message: row.message as string,
+    budget: Number(row.budget),
+    deliveryTime: Number(row.delivery_time),
+    milestones,
     status: row.status as ProposalStatus,
-    contractId: (row.contract_id as string | null) ?? null,
-    acceptedAt:
-      row.accepted_at instanceof Date
-        ? row.accepted_at.toISOString()
-        : (row.accepted_at as string | null) ?? null,
-    rejectedAt:
-      row.rejected_at instanceof Date
-        ? row.rejected_at.toISOString()
-        : (row.rejected_at as string | null) ?? null,
-    createdAt:
-      row.created_at instanceof Date
-        ? row.created_at.toISOString()
-        : (row.created_at as string),
-    updatedAt:
-      row.updated_at instanceof Date
-        ? row.updated_at.toISOString()
-        : (row.updated_at as string),
-  }
+    createdAt: toIso(row.created_at),
+    updatedAt: toIso(row.updated_at),
+  };
 }
 
-/** Returns a direct Neon connection that supports transaction-mode queries. */
-function getTxDb() {
-  const url = process.env.DATABASE_URL
-  if (!url) {
-    throw new Error(
-      'DATABASE_URL environment variable is not set. ' +
-        'Copy env.example to .env and fill in your Neon connection string.',
-    )
-  }
-  return neon(url)
+// ─── Lookups ────────────────────────────────────────────────────────────────
+
+export interface UserRow {
+  id: string;
+  role: string;
 }
 
-// ─── Public API ───────────────────────────────────────────────────────────
-
-/**
- * Fetches a single proposal by its UUID.  Returns null if not found.
- */
-export async function getProposalById(id: string): Promise<Proposal | null> {
-  const db = getTxDb()
-  const rows = (await db('SELECT * FROM proposals WHERE id = $1 LIMIT 1', [id])) as Record<
-    string,
-    unknown
-  >[]
-  if (rows.length === 0) return null
-  return rowToProposal(rows[0])
+export interface ProjectRow {
+  id: string;
+  client_id: string;
+  status: string;
 }
 
-/**
- * Atomically accepts a freelancer proposal and creates the resulting
- * contract + milestone records.
- *
- * Steps (all within a single DB transaction):
- *  1. Lock & validate the proposal (must be 'pending').
- *  2. Verify the caller is the project's client.
- *  3. Verify the project is in an acceptable state (open / in_progress).
- *  4. Mark the proposal 'accepted'.
- *  5. Reject all other pending proposals for the same project.
- *  6. Create the contract record (status='pending', escrow_status='unfunded').
- *  7. Update the proposal's contract_id back-reference.
- *  8. Create milestone rows from proposal.milestone_breakdown.
- *  9. Advance the project status to 'in_progress'.
- * 10. Insert an admin_audit_log entry for traceability.
- *
- * @param proposalId  UUID of the proposal to accept.
- * @param clientId    UUID of the authenticated user (must be project client).
- * @returns           The updated proposal, the new contract, and the milestones.
- */
-export async function acceptProposal(
+export async function findUserByWallet(walletAddress: string): Promise<UserRow | null> {
+  const rows = (await sql`
+    SELECT id, role FROM users WHERE wallet_address = ${walletAddress} LIMIT 1
+  `) as Array<Record<string, unknown>>;
+  if (!rows.length) return null;
+  return { id: String(rows[0].id), role: String(rows[0].role) };
+}
+
+export async function findProject(projectId: string): Promise<ProjectRow | null> {
+  const rows = (await sql`
+    SELECT id, client_id, status FROM projects WHERE id = ${projectId} LIMIT 1
+  `) as Array<Record<string, unknown>>;
+  if (!rows.length) return null;
+  return {
+    id: String(rows[0].id),
+    client_id: String(rows[0].client_id),
+    status: String(rows[0].status),
+  };
+}
+
+export async function findProposalWithProject(
   proposalId: string,
-  clientId: string,
-): Promise<AcceptProposalResult> {
-  const db = getTxDb()
+): Promise<{ proposal: Proposal; clientId: string } | null> {
+  const rows = (await sql`
+    SELECT pp.*, p.client_id AS project_client_id
+    FROM project_proposals pp
+    JOIN projects p ON p.id = pp.project_id
+    WHERE pp.id = ${proposalId}
+    LIMIT 1
+  `) as Array<Record<string, unknown>>;
+  if (!rows.length) return null;
+  return { proposal: rowToProposal(rows[0]), clientId: String(rows[0].project_client_id) };
+}
 
-  // ── Begin transaction ────────────────────────────────────────────────────
-  await db('BEGIN', [])
+/** Returns the freelancer's active (non-rejected) proposal on the project, if any. */
+export async function findActiveProposal(
+  projectId: string,
+  freelancerId: string,
+): Promise<{ id: string } | null> {
+  const rows = (await sql`
+    SELECT id FROM project_proposals
+    WHERE project_id = ${projectId}
+      AND freelancer_id = ${freelancerId}
+      AND status <> 'rejected'
+    LIMIT 1
+  `) as Array<Record<string, unknown>>;
+  return rows.length ? { id: String(rows[0].id) } : null;
+}
 
-  try {
-    // ── Step 1: Lock & fetch the proposal ───────────────────────────────────
-    const proposalRows = (await db(
-      'SELECT * FROM proposals WHERE id = $1 FOR UPDATE',
-      [proposalId],
-    )) as Record<string, unknown>[]
+// ─── Caching ────────────────────────────────────────────────────────────────
+// List results are cached briefly per project. Each write bumps the
+// project's version so stale pages are never served after a change within
+// the same instance.
 
-    if (proposalRows.length === 0) {
-      throw new ProposalNotFoundError(proposalId)
-    }
+const LIST_CACHE_TTL_MS = 30_000;
+const projectCacheVersion = new Map<string, number>();
 
-    const proposalRow = proposalRows[0]
+function listCacheKey(projectId: string, parts: Array<string | number | undefined>): string {
+  const version = projectCacheVersion.get(projectId) ?? 0;
+  return `proposals:${projectId}:v${version}:${parts.map((p) => p ?? "*").join(":")}`;
+}
 
-    if (proposalRow.status === 'accepted') {
-      throw new ProposalAlreadyAcceptedError(proposalId)
-    }
-    if (proposalRow.status !== 'pending') {
-      throw new ProposalNotPendingError(proposalRow.status as string)
-    }
+export function invalidateProjectProposals(projectId: string): void {
+  projectCacheVersion.set(projectId, (projectCacheVersion.get(projectId) ?? 0) + 1);
+}
 
-    const projectId = proposalRow.project_id as string
-    const freelancerId = proposalRow.freelancer_id as string
-    const proposedAmount = Number(proposalRow.proposed_amount)
-    const currency = proposalRow.currency as string
-    const milestoneBreakdown = (proposalRow.milestone_breakdown as ProposalMilestone[]) ?? []
+// ─── Mutations & queries ────────────────────────────────────────────────────
 
-    // ── Step 2: Verify caller is the project client ──────────────────────────
-    const projectRows = (await db(
-      'SELECT id, client_id, status FROM projects WHERE id = $1 FOR UPDATE',
-      [projectId],
-    )) as Record<string, unknown>[]
+/** Postgres unique_violation — raised by uq_project_proposals_active. */
+export function isUniqueViolation(err: unknown): boolean {
+  return typeof err === "object" && err !== null && (err as { code?: string }).code === "23505";
+}
 
-    if (projectRows.length === 0) {
-      throw new ProposalNotFoundError(projectId) // project vanished
-    }
-
-    const project = projectRows[0]
-
-    if (project.client_id !== clientId) {
-      throw new UnauthorizedAcceptanceError()
-    }
-
-    // ── Step 3: Validate project state ──────────────────────────────────────
-    const projectStatus = project.status as string
-    if (!['open', 'in_progress', 'draft'].includes(projectStatus)) {
-      throw new ProjectNotActiveError(projectStatus)
-    }
-
-    // ── Step 4: Mark proposal as accepted ───────────────────────────────────
-    const acceptedRows = (await db(
-      `UPDATE proposals
-          SET status      = 'accepted',
-              accepted_at = NOW(),
-              updated_at  = NOW()
-        WHERE id = $1
-        RETURNING *`,
-      [proposalId],
-    )) as Record<string, unknown>[]
-
-    const acceptedProposal = acceptedRows[0]
-
-    // ── Step 5: Reject remaining pending proposals for this project ─────────
-    await db(
-      `UPDATE proposals
-          SET status      = 'rejected',
-              rejected_at = NOW(),
-              updated_at  = NOW()
-        WHERE project_id = $1
-          AND id != $2
-          AND status = 'pending'`,
-      [projectId, proposalId],
+export async function insertProposal(
+  projectId: string,
+  freelancerId: string,
+  input: CreateProposalInput,
+): Promise<Proposal> {
+  const rows = (await sql`
+    INSERT INTO project_proposals (
+      project_id, freelancer_id, message, budget, delivery_time, milestones, status
+    ) VALUES (
+      ${projectId},
+      ${freelancerId},
+      ${input.message},
+      ${input.budget},
+      ${input.deliveryTime},
+      ${JSON.stringify(input.milestones ?? [])}::jsonb,
+      'submitted'
     )
+    RETURNING *
+  `) as Array<Record<string, unknown>>;
+  invalidateProjectProposals(projectId);
+  return rowToProposal(rows[0]);
+}
 
-    // ── Step 6: Create contract ──────────────────────────────────────────────
-    const contractRows = (await db(
-      `INSERT INTO contracts (
-          project_id, client_id, freelancer_id,
-          total_amount, currency,
-          status, escrow_status
-        ) VALUES ($1, $2, $3, $4, $5, 'pending', 'unfunded')
-        RETURNING *`,
-      [projectId, clientId, freelancerId, proposedAmount, currency],
-    )) as Record<string, unknown>[]
+export interface ListProposalsOptions {
+  projectId: string;
+  status?: ProposalStatus;
+  /** When set, only this freelancer's proposals are returned. */
+  freelancerId?: string;
+  page: number;
+  pageSize: number;
+}
 
-    const contractRow = contractRows[0]
-    const contractId = contractRow.id as string
+export interface ProposalPage {
+  proposals: Proposal[];
+  pagination: {
+    page: number;
+    pageSize: number;
+    total: number;
+    totalPages: number;
+    hasMore: boolean;
+  };
+}
 
-    // ── Step 7: Back-reference proposal → contract ───────────────────────────
-    await db(
-      `UPDATE proposals
-          SET contract_id = $1,
-              updated_at  = NOW()
-        WHERE id = $2`,
-      [contractId, proposalId],
-    )
+export async function listProposals(opts: ListProposalsOptions): Promise<ProposalPage> {
+  const { projectId, status, freelancerId, page, pageSize } = opts;
+  const key = listCacheKey(projectId, [status, freelancerId, page, pageSize]);
+  const cached = cacheGet<ProposalPage>(key);
+  if (cached) return cached;
 
-    // ── Step 8: Create milestones from breakdown ─────────────────────────────
-    const createdMilestones: Array<{
-      id: string
-      contractId: string
-      projectId: string
-      title: string
-      description: string | null
-      amount: number
-      currency: string
-      dueDate: string | null
-      sortOrder: number
-      status: string
-      createdAt: string
-    }> = []
+  const offset = (page - 1) * pageSize;
+  const statusFilter = status ?? null;
+  const freelancerFilter = freelancerId ?? null;
 
-    for (let i = 0; i < milestoneBreakdown.length; i++) {
-      const m = milestoneBreakdown[i]
-      const milestoneRows = (await db(
-        `INSERT INTO milestones (
-            project_id, contract_id,
-            title, description,
-            amount, currency,
-            due_date, sort_order,
-            status
-          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')
-          RETURNING *`,
-        [
-          projectId,
-          contractId,
-          m.title,
-          m.description ?? null,
-          m.amount,
-          currency,
-          m.due_date ?? null,
-          i,
-        ],
-      )) as Record<string, unknown>[]
+  const rows = (await sql`
+    SELECT pp.*, COUNT(*) OVER() AS total_count
+    FROM project_proposals pp
+    WHERE pp.project_id = ${projectId}
+      AND (${statusFilter}::proposal_status IS NULL OR pp.status = ${statusFilter}::proposal_status)
+      AND (${freelancerFilter}::uuid IS NULL OR pp.freelancer_id = ${freelancerFilter}::uuid)
+    ORDER BY pp.created_at DESC
+    LIMIT ${pageSize} OFFSET ${offset}
+  `) as Array<Record<string, unknown>>;
 
-      const mr = milestoneRows[0]
-      createdMilestones.push({
-        id: mr.id as string,
-        contractId: mr.contract_id as string,
-        projectId: mr.project_id as string,
-        title: mr.title as string,
-        description: (mr.description as string | null) ?? null,
-        amount: Number(mr.amount),
-        currency: mr.currency as string,
-        dueDate:
-          mr.due_date instanceof Date
-            ? mr.due_date.toISOString()
-            : (mr.due_date as string | null) ?? null,
-        sortOrder: Number(mr.sort_order),
-        status: mr.status as string,
-        createdAt:
-          mr.created_at instanceof Date
-            ? mr.created_at.toISOString()
-            : (mr.created_at as string),
-      })
-    }
+  // Empty state: a project with no proposals returns an empty list, not an error.
+  const total = rows.length ? Number(rows[0].total_count) || 0 : 0;
+  const result: ProposalPage = {
+    proposals: rows.map(rowToProposal),
+    pagination: {
+      page,
+      pageSize,
+      total,
+      totalPages: Math.ceil(total / pageSize),
+      hasMore: page * pageSize < total,
+    },
+  };
+  cacheSet(key, result, LIST_CACHE_TTL_MS);
+  return result;
+}
 
-    // ── Step 9: Advance project to 'in_progress' ────────────────────────────
-    await db(
-      `UPDATE projects
-          SET status     = 'in_progress',
-              started_at = NOW(),
-              updated_at = NOW()
-        WHERE id = $1`,
-      [projectId],
-    )
+/**
+ * Applies a freelancer content edit. The status moves to `updated`, and the
+ * WHERE clause re-checks editability so a concurrent accept/reject wins.
+ */
+export async function updateProposalContent(
+  current: Proposal,
+  input: Omit<UpdateProposalInput, "status">,
+): Promise<Proposal | null> {
+  const message = input.message ?? current.message;
+  const budget = input.budget ?? current.budget;
+  const deliveryTime = input.deliveryTime ?? current.deliveryTime;
+  const milestones = input.milestones ?? current.milestones;
 
-    // ── Step 10: Audit log ───────────────────────────────────────────────────
-    await db(
-      `INSERT INTO admin_audit_logs (
-          admin_user_id, action,
-          target_type, target_id, details
-        ) VALUES ($1, 'PROPOSAL_ACCEPTED', 'contract', $2, $3::jsonb)`,
-      [
-        clientId,
-        contractId,
-        JSON.stringify({
-          proposalId,
-          projectId,
-          freelancerId,
-          contractId,
-          totalAmount: proposedAmount,
-          currency,
-          milestoneCount: milestoneBreakdown.length,
-          timestamp: new Date().toISOString(),
-        }),
-      ],
-    )
+  const rows = (await sql`
+    UPDATE project_proposals
+    SET message       = ${message},
+        budget        = ${budget},
+        delivery_time = ${deliveryTime},
+        milestones    = ${JSON.stringify(milestones)}::jsonb,
+        status        = 'updated',
+        updated_at    = NOW()
+    WHERE id = ${current.id}
+      AND status IN ('submitted', 'under_review', 'updated')
+    RETURNING *
+  `) as Array<Record<string, unknown>>;
+  if (!rows.length) return null;
+  invalidateProjectProposals(current.projectId);
+  return rowToProposal(rows[0]);
+}
 
-    // ── Commit ───────────────────────────────────────────────────────────────
-    await db('COMMIT', [])
+/** Moves a proposal to `next`, guarded on the status it was read with. */
+export async function updateProposalStatus(
+  current: Proposal,
+  next: ProposalStatus,
+): Promise<Proposal | null> {
+  const rows = (await sql`
+    UPDATE project_proposals
+    SET status = ${next}::proposal_status,
+        updated_at = NOW()
+    WHERE id = ${current.id}
+      AND status = ${current.status}::proposal_status
+    RETURNING *
+  `) as Array<Record<string, unknown>>;
+  if (!rows.length) return null;
+  invalidateProjectProposals(current.projectId);
+  return rowToProposal(rows[0]);
+}
 
-    // ── Build return value ───────────────────────────────────────────────────
-    const finalProposal = rowToProposal({
-      ...acceptedProposal,
-      contract_id: contractId,
-    })
-
-    const contract = {
-      id: contractId,
-      projectId: contractRow.project_id as string,
-      clientId: contractRow.client_id as string,
-      freelancerId: contractRow.freelancer_id as string,
-      status: contractRow.status as string,
-      escrowStatus: contractRow.escrow_status as string,
-      totalAmount: Number(contractRow.total_amount),
-      currency: contractRow.currency as string,
-      proposalId,
-      createdAt:
-        contractRow.created_at instanceof Date
-          ? contractRow.created_at.toISOString()
-          : (contractRow.created_at as string),
-      updatedAt:
-        contractRow.updated_at instanceof Date
-          ? contractRow.updated_at.toISOString()
-          : (contractRow.updated_at as string),
-    }
-
-    return { proposal: finalProposal, contract, milestones: createdMilestones }
-  } catch (err) {
-    // Roll back all changes on any error
-    await db('ROLLBACK', [])
-    throw err
-  }
+export async function deleteProposal(proposal: Proposal): Promise<boolean> {
+  const rows = (await sql`
+    DELETE FROM project_proposals
+    WHERE id = ${proposal.id}
+      AND status <> 'accepted'
+    RETURNING id
+  `) as Array<Record<string, unknown>>;
+  if (rows.length) invalidateProjectProposals(proposal.projectId);
+  return rows.length > 0;
 }

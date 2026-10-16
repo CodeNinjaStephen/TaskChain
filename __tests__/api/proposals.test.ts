@@ -1,699 +1,329 @@
-// __tests__/api/proposals.test.ts
-//
-// Unit tests for:
-//   - POST /api/proposals/[id]/accept (route handler)
-//   - lib/proposals.ts  (service layer)
-//
-// Strategy:
-//   • lib/db sql      → vi.mock, queued with mockResolvedValueOnce (route layer)
-//   • @neondatabase/serverless neon() → vi.mock returning a shared dbMock
-//     (lib/proposals.ts uses neon() directly for transaction support)
-//   • Auth middleware  → vi.mock with injectAuth helper
-//   • DATABASE_URL     → set to a dummy value so getTxDb() doesn't throw
-//     before neon() is called
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { NextRequest } from "next/server";
 
-// Must be set before lib/proposals.ts is imported
-process.env.DATABASE_URL = 'postgres://test:test@localhost/test'
-
-import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { NextRequest } from 'next/server'
-
-// ─── Shared constants ─────────────────────────────────────────────────────
-
-const TEST_WALLET = 'GCLIENTWALLET00000000000000000000000000000000000000000000'
-const TEST_CLIENT_ID = '00000000-0000-0000-0000-aaaaaaaaaaaa'
-const TEST_FREELANCER_ID = '00000000-0000-0000-0000-bbbbbbbbbbbb'
-const TEST_PROJECT_ID = '00000000-0000-0000-0000-cccccccccccc'
-const TEST_PROPOSAL_ID = '00000000-0000-0000-0000-dddddddddddd'
-const TEST_CONTRACT_ID = '00000000-0000-0000-0000-eeeeeeeeeeee'
-
-// ─── Mock: auth middleware ────────────────────────────────────────────────
-
-vi.mock('@/lib/auth/middleware', async () => {
-  const actual = await vi.importActual<typeof import('@/lib/auth/middleware')>(
-    '@/lib/auth/middleware',
-  )
-  const injectAuth =
-    (handler: (...args: unknown[]) => unknown) =>
-    async (request: unknown, ...rest: unknown[]) =>
-      handler(
-        request,
-        { walletAddress: TEST_WALLET, tokenJti: 'test-jti' },
-        ...rest,
-      )
-  return { ...actual, withAuth: injectAuth, withAuthCtx: injectAuth }
-})
-
-// ─── Mock: lib/db (sql tagged-template used in the route handler) ─────────
-
-vi.mock('@/lib/db', () => ({ sql: vi.fn() }))
-
-// ─── Mock: @neondatabase/serverless ──────────────────────────────────────
-//
-// lib/proposals.ts does: const db = neon(url); await db('BEGIN', [])
-// We mock neon() to always return the same dbMock so we can queue
-// return values on it.
-
-const dbMock = vi.fn()
-vi.mock('@neondatabase/serverless', () => ({
-  neon: vi.fn(() => dbMock),
-}))
-
-// ─── Imports (after mocks are hoisted) ───────────────────────────────────
-
-import { sql } from '@/lib/db'
-import { POST } from '@/app/api/proposals/[id]/accept/route'
 import {
-  acceptProposal,
-  getProposalById,
-  ProposalAlreadyAcceptedError,
-  ProposalNotFoundError,
-  ProposalNotPendingError,
-  ProjectNotActiveError,
-  UnauthorizedAcceptanceError,
-} from '@/lib/proposals'
+  GET as listProposals,
+  POST as createProposal,
+} from "@/app/api/projects/[id]/proposals/route";
+import {
+  PATCH as updateProposal,
+  DELETE as deleteProposal,
+} from "@/app/api/proposals/[id]/route";
+import { canTransition, isEditable } from "@/lib/proposals";
 
-type SqlMock = ReturnType<typeof vi.fn>
+vi.mock("@/lib/auth/session", () => ({
+  readAccessToken: vi.fn().mockReturnValue("token"),
+  verifyAccessToken: vi
+    .fn()
+    .mockReturnValue({ walletAddress: "GABC", jti: "jti-1" }),
+}));
 
-/** Queue sequential return values on the route-level sql mock */
+vi.mock("@/lib/db", () => ({
+  sql: vi.fn(),
+}));
+
+// Always miss the cache so each test drives its own SQL responses.
+vi.mock("@/lib/cache", () => ({
+  cacheGet: vi.fn().mockReturnValue(undefined),
+  cacheSet: vi.fn(),
+  cacheDelete: vi.fn(),
+}));
+
+import { sql } from "@/lib/db";
+import { readAccessToken } from "@/lib/auth/session";
+
+type SqlMock = ReturnType<typeof vi.fn>;
+
+const PROJECT_ID = "11111111-1111-4111-8111-111111111111";
+const PROPOSAL_ID = "22222222-2222-4222-8222-222222222222";
+const FREELANCER_ID = "33333333-3333-4333-8333-333333333333";
+const CLIENT_ID = "44444444-4444-4444-8444-444444444444";
+const OTHER_ID = "55555555-5555-4555-8555-555555555555";
+
+const freelancer = { id: FREELANCER_ID, role: "freelancer" };
+const client = { id: CLIENT_ID, role: "client" };
+const openProject = { id: PROJECT_ID, client_id: CLIENT_ID, status: "open" };
+
+const validBody = {
+  message: "I have built several Soroban escrow dApps and can deliver this.",
+  budget: 1500,
+  deliveryTime: 14,
+  milestones: [
+    { title: "Design", amount: 500 },
+    { title: "Build", amount: 1000, dueInDays: 10 },
+  ],
+};
+
+function proposalRow(overrides: Record<string, unknown> = {}) {
+  return {
+    id: PROPOSAL_ID,
+    project_id: PROJECT_ID,
+    freelancer_id: FREELANCER_ID,
+    message: validBody.message,
+    budget: "1500.000000",
+    delivery_time: 14,
+    milestones: validBody.milestones,
+    status: "submitted",
+    created_at: new Date("2026-01-01T00:00:00Z"),
+    updated_at: new Date("2026-01-01T00:00:00Z"),
+    project_client_id: CLIENT_ID,
+    ...overrides,
+  };
+}
+
 function queueSql(responses: unknown[]) {
-  const mock = sql as unknown as SqlMock
-  for (const r of responses) mock.mockResolvedValueOnce(r)
+  const mock = sql as unknown as SqlMock;
+  for (const response of responses) mock.mockResolvedValueOnce(response);
 }
 
-/** Queue a rejection on the direct-neon dbMock */
-function queueDbReject(err: unknown) {
-  dbMock.mockRejectedValueOnce(err)
+function ctx(id: string) {
+  return { params: Promise.resolve({ id }) };
 }
 
-/** Queue sequential return values on the direct-neon dbMock.
- *  If an entry is an Error instance it is queued as a rejection so the
- *  service code catches it correctly. */
-function queueDb(responses: unknown[]) {
-  for (const r of responses) {
-    if (r instanceof Error) {
-      dbMock.mockRejectedValueOnce(r)
-    } else {
-      dbMock.mockResolvedValueOnce(r)
-    }
-  }
-}
-
-// ─── Request factory ──────────────────────────────────────────────────────
-
-function makePostRequest(proposalId: string, body?: Record<string, unknown>): NextRequest {
-  const url = `http://localhost/api/proposals/${proposalId}/accept`
+function jsonRequest(url: string, method: string, body?: unknown) {
   return new NextRequest(
     new Request(url, {
-      method: 'POST',
-      headers: body !== undefined ? { 'Content-Type': 'application/json' } : {},
-      body: body !== undefined ? JSON.stringify(body) : undefined,
+      method,
+      headers: { "content-type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
     }),
-  )
+  );
 }
 
-function routeCtx(proposalId: string) {
-  return { params: Promise.resolve({ id: proposalId }) }
-}
+const projectUrl = `http://localhost/api/projects/${PROJECT_ID}/proposals`;
+const proposalUrl = `http://localhost/api/proposals/${PROPOSAL_ID}`;
 
-// ─── Data factories ───────────────────────────────────────────────────────
+beforeEach(() => {
+  vi.clearAllMocks();
+  (sql as unknown as SqlMock).mockReset();
+  (readAccessToken as unknown as SqlMock).mockReturnValue("token");
+});
 
-function proposalRow(overrides: Record<string, unknown> = {}): Record<string, unknown> {
-  return {
-    id: TEST_PROPOSAL_ID,
-    project_id: TEST_PROJECT_ID,
-    freelancer_id: TEST_FREELANCER_ID,
-    cover_letter: 'I am a great fit',
-    proposed_amount: '500.000000',
-    currency: 'USDC',
-    estimated_duration: '2 weeks',
-    milestone_breakdown: [],
-    status: 'pending',
-    contract_id: null,
-    accepted_at: null,
-    rejected_at: null,
-    created_at: new Date('2026-01-01'),
-    updated_at: new Date('2026-01-01'),
-    ...overrides,
-  }
-}
+describe("status lifecycle", () => {
+  it("allows the defined transitions and blocks the rest", () => {
+    expect(canTransition("submitted", "under_review")).toBe(true);
+    expect(canTransition("under_review", "accepted")).toBe(true);
+    expect(canTransition("updated", "rejected")).toBe(true);
+    expect(canTransition("accepted", "rejected")).toBe(false);
+    expect(canTransition("rejected", "under_review")).toBe(false);
+    expect(canTransition("under_review", "submitted")).toBe(false);
+  });
 
-function projectRow(overrides: Record<string, unknown> = {}): Record<string, unknown> {
-  return { id: TEST_PROJECT_ID, client_id: TEST_CLIENT_ID, status: 'open', ...overrides }
-}
+  it("only treats undecided proposals as editable", () => {
+    expect(isEditable("submitted")).toBe(true);
+    expect(isEditable("under_review")).toBe(true);
+    expect(isEditable("updated")).toBe(true);
+    expect(isEditable("accepted")).toBe(false);
+    expect(isEditable("rejected")).toBe(false);
+  });
+});
 
-function contractRow(overrides: Record<string, unknown> = {}): Record<string, unknown> {
-  return {
-    id: TEST_CONTRACT_ID,
-    project_id: TEST_PROJECT_ID,
-    client_id: TEST_CLIENT_ID,
-    freelancer_id: TEST_FREELANCER_ID,
-    total_amount: '500.000000',
-    currency: 'USDC',
-    status: 'pending',
-    escrow_status: 'unfunded',
-    created_at: new Date('2026-01-01'),
-    updated_at: new Date('2026-01-01'),
-    ...overrides,
-  }
-}
+describe("POST /api/projects/[id]/proposals", () => {
+  it("returns 401 in the standard envelope without authentication", async () => {
+    (readAccessToken as unknown as SqlMock).mockReturnValueOnce(null);
+    const res = await createProposal(jsonRequest(projectUrl, "POST", validBody), ctx(PROJECT_ID));
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    expect(body).toEqual({
+      success: false,
+      data: null,
+      errors: [{ code: "AUTH_REQUIRED", message: "Authentication is required" }],
+    });
+    expect(sql).not.toHaveBeenCalled();
+  });
 
-// ─── Setup ────────────────────────────────────────────────────────────────
+  it("returns 422 with field-level messages for invalid input", async () => {
+    const res = await createProposal(
+      jsonRequest(projectUrl, "POST", { message: "short", budget: -5 }),
+      ctx(PROJECT_ID),
+    );
+    expect(res.status).toBe(422);
+    const body = await res.json();
+    expect(body.success).toBe(false);
+    const fields = body.errors.map((e: { field: string }) => e.field);
+    expect(fields).toEqual(expect.arrayContaining(["message", "budget", "deliveryTime"]));
+  });
 
-beforeEach(async () => {
-  // Reset all mocks fully (clears call history and queued return values)
-  vi.resetAllMocks()
-  // Re-establish the neon() → dbMock binding (resetAllMocks wipes it)
-  const mod = await vi.importMock<typeof import('@neondatabase/serverless')>(
-    '@neondatabase/serverless',
-  )
-  vi.mocked(mod.neon).mockReturnValue(dbMock as ReturnType<typeof mod.neon>)
-})
+  it("rejects milestones that exceed the budget", async () => {
+    const res = await createProposal(
+      jsonRequest(projectUrl, "POST", { ...validBody, budget: 100 }),
+      ctx(PROJECT_ID),
+    );
+    expect(res.status).toBe(422);
+    const body = await res.json();
+    expect(body.errors[0].field).toBe("milestones");
+  });
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Route handler tests — POST /api/proposals/[id]/accept
-// ═══════════════════════════════════════════════════════════════════════════
+  it("returns 403 when the caller is not a freelancer", async () => {
+    queueSql([[client]]);
+    const res = await createProposal(jsonRequest(projectUrl, "POST", validBody), ctx(PROJECT_ID));
+    expect(res.status).toBe(403);
+  });
 
-describe('POST /api/proposals/[id]/accept — route handler', () => {
-  // ── Parameter validation ────────────────────────────────────────────────
+  it("returns 404 when the project does not exist", async () => {
+    queueSql([[freelancer], []]);
+    const res = await createProposal(jsonRequest(projectUrl, "POST", validBody), ctx(PROJECT_ID));
+    expect(res.status).toBe(404);
+    expect((await res.json()).errors[0].code).toBe("PROJECT_NOT_FOUND");
+  });
 
-  it('returns 400 when proposal ID is not a valid UUID', async () => {
-    const req = makePostRequest('not-a-uuid')
-    const res = await POST(req, routeCtx('not-a-uuid'))
-    expect(res.status).toBe(400)
-    const body = await res.json()
-    expect(body.code).toBe('INVALID_UUID')
-  })
+  it("returns 409 for a duplicate active proposal", async () => {
+    queueSql([[freelancer], [openProject], [{ id: PROPOSAL_ID }]]);
+    const res = await createProposal(jsonRequest(projectUrl, "POST", validBody), ctx(PROJECT_ID));
+    expect(res.status).toBe(409);
+    expect((await res.json()).errors[0].code).toBe("DUPLICATE_PROPOSAL");
+  });
 
-  it('returns 400 when request body is not valid JSON', async () => {
-    const url = `http://localhost/api/proposals/${TEST_PROPOSAL_ID}/accept`
-    const req = new NextRequest(
-      new Request(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: '{invalid-json}',
-      }),
-    )
-    const res = await POST(req, routeCtx(TEST_PROPOSAL_ID))
-    expect(res.status).toBe(400)
-    const body = await res.json()
-    expect(body.code).toBe('INVALID_JSON')
-  })
+  it("returns 409 when a concurrent insert hits the unique index", async () => {
+    queueSql([[freelancer], [openProject], []]);
+    (sql as unknown as SqlMock).mockRejectedValueOnce(Object.assign(new Error("dup"), { code: "23505" }));
+    const res = await createProposal(jsonRequest(projectUrl, "POST", validBody), ctx(PROJECT_ID));
+    expect(res.status).toBe(409);
+  });
 
-  it('returns 422 when body fails schema validation', async () => {
-    const req = makePostRequest(TEST_PROPOSAL_ID, { notes: 'x'.repeat(1001) })
-    const res = await POST(req, routeCtx(TEST_PROPOSAL_ID))
-    expect(res.status).toBe(422)
-    const body = await res.json()
-    expect(body.code).toBe('INVALID_REQUEST_BODY')
-    expect(body.details).toHaveProperty('notes')
-  })
+  it("creates the proposal with status submitted", async () => {
+    queueSql([[freelancer], [openProject], [], [proposalRow()]]);
+    const res = await createProposal(jsonRequest(projectUrl, "POST", validBody), ctx(PROJECT_ID));
+    expect(res.status).toBe(201);
+    const body = await res.json();
+    expect(body.success).toBe(true);
+    expect(body.errors).toBeNull();
+    expect(body.data).toMatchObject({
+      id: PROPOSAL_ID,
+      projectId: PROJECT_ID,
+      freelancerId: FREELANCER_ID,
+      budget: 1500,
+      deliveryTime: 14,
+      status: "submitted",
+    });
+  });
+});
 
-  // ── Auth & role guards ──────────────────────────────────────────────────
+describe("GET /api/projects/[id]/proposals", () => {
+  it("returns an empty list for a project with no proposals", async () => {
+    queueSql([[client], [openProject], []]);
+    const res = await listProposals(jsonRequest(projectUrl, "GET"), ctx(PROJECT_ID));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.success).toBe(true);
+    expect(body.data.proposals).toEqual([]);
+    expect(body.data.pagination).toMatchObject({ total: 0, hasMore: false, page: 1, pageSize: 20 });
+  });
 
-  it('returns 401 when authenticated wallet has no user record', async () => {
-    queueSql([[]])   // SELECT id, role FROM users → empty
-    const req = makePostRequest(TEST_PROPOSAL_ID)
-    const res = await POST(req, routeCtx(TEST_PROPOSAL_ID))
-    expect(res.status).toBe(401)
-    const body = await res.json()
-    expect(body.code).toBe('USER_NOT_FOUND')
-  })
+  it("paginates results for the project client", async () => {
+    queueSql([[client], [openProject], [{ ...proposalRow(), total_count: "3" }]]);
+    const res = await listProposals(
+      jsonRequest(`${projectUrl}?page=1&pageSize=1&status=submitted`, "GET"),
+      ctx(PROJECT_ID),
+    );
+    const body = await res.json();
+    expect(res.status).toBe(200);
+    expect(body.data.proposals).toHaveLength(1);
+    expect(body.data.pagination).toMatchObject({ total: 3, totalPages: 3, hasMore: true });
+  });
 
-  it('returns 403 when caller has role=freelancer', async () => {
-    queueSql([[{ id: TEST_FREELANCER_ID, role: 'freelancer' }]])
-    const req = makePostRequest(TEST_PROPOSAL_ID)
-    const res = await POST(req, routeCtx(TEST_PROPOSAL_ID))
-    expect(res.status).toBe(403)
-    const body = await res.json()
-    expect(body.code).toBe('FORBIDDEN')
-  })
+  it("rejects an unknown status filter", async () => {
+    const res = await listProposals(jsonRequest(`${projectUrl}?status=bogus`, "GET"), ctx(PROJECT_ID));
+    expect(res.status).toBe(400);
+    expect((await res.json()).errors[0].field).toBe("status");
+  });
 
-  // ── Happy path ──────────────────────────────────────────────────────────
+  it("returns 403 for a client who does not own the project", async () => {
+    queueSql([[{ id: OTHER_ID, role: "client" }], [openProject]]);
+    const res = await listProposals(jsonRequest(projectUrl, "GET"), ctx(PROJECT_ID));
+    expect(res.status).toBe(403);
+  });
+});
 
-  it('returns 201 with proposal, contract, and milestones on success', async () => {
-    // Route-level: resolve wallet
-    queueSql([[{ id: TEST_CLIENT_ID, role: 'client' }]])
+describe("PATCH /api/proposals/[id]", () => {
+  it("returns 404 for an unknown proposal", async () => {
+    queueSql([[freelancer], []]);
+    const res = await updateProposal(jsonRequest(proposalUrl, "PATCH", { budget: 1200 }), ctx(PROPOSAL_ID));
+    expect(res.status).toBe(404);
+  });
 
-    // Service-level transaction (10 steps for empty milestone breakdown)
-    queueDb([
-      [],                                          // BEGIN
-      [proposalRow()],                             // SELECT proposal FOR UPDATE
-      [projectRow()],                              // SELECT project FOR UPDATE
-      [proposalRow({ status: 'accepted', accepted_at: new Date() })], // UPDATE proposal
-      [],                                          // UPDATE reject other proposals
-      [contractRow()],                             // INSERT contract
-      [],                                          // UPDATE proposal.contract_id
-      // (no milestone iterations — empty array)
-      [],                                          // UPDATE project status
-      [],                                          // INSERT audit log
-      [],                                          // COMMIT
-    ])
+  it("returns 403 when another freelancer edits the proposal", async () => {
+    queueSql([[{ id: OTHER_ID, role: "freelancer" }], [proposalRow()]]);
+    const res = await updateProposal(jsonRequest(proposalUrl, "PATCH", { budget: 1600 }), ctx(PROPOSAL_ID));
+    expect(res.status).toBe(403);
+  });
 
-    const req = makePostRequest(TEST_PROPOSAL_ID)
-    const res = await POST(req, routeCtx(TEST_PROPOSAL_ID))
-    expect(res.status).toBe(201)
-    const body = await res.json()
-    expect(body.message).toMatch(/accepted/i)
-    expect(body.proposal.id).toBe(TEST_PROPOSAL_ID)
-    expect(body.contract.id).toBe(TEST_CONTRACT_ID)
-    expect(body.contract.escrowStatus).toBe('unfunded')
-    expect(body.milestones).toBeInstanceOf(Array)
-    expect(body.milestones).toHaveLength(0)
-  })
+  it("blocks edits once the proposal is accepted", async () => {
+    queueSql([[freelancer], [proposalRow({ status: "accepted" })]]);
+    const res = await updateProposal(jsonRequest(proposalUrl, "PATCH", { budget: 1600 }), ctx(PROPOSAL_ID));
+    expect(res.status).toBe(409);
+    expect((await res.json()).errors[0].code).toBe("PROPOSAL_NOT_EDITABLE");
+  });
 
-  it('creates milestones from proposal milestone_breakdown', async () => {
-    const milestones = [
-      { title: 'Design', amount: 200, description: 'UI mockups' },
-      { title: 'Dev', amount: 300, description: 'Implementation' },
-    ]
+  it("checks milestone totals against the stored budget on partial edits", async () => {
+    queueSql([[freelancer], [proposalRow()]]);
+    const res = await updateProposal(jsonRequest(proposalUrl, "PATCH", { budget: 1000 }), ctx(PROPOSAL_ID));
+    expect(res.status).toBe(422);
+  });
 
-    queueSql([[{ id: TEST_CLIENT_ID, role: 'client' }]])
+  it("lets the owner edit and marks the proposal updated", async () => {
+    queueSql([[freelancer], [proposalRow()], [proposalRow({ budget: "1600", status: "updated" })]]);
+    const res = await updateProposal(jsonRequest(proposalUrl, "PATCH", { budget: 1600 }), ctx(PROPOSAL_ID));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data).toMatchObject({ budget: 1600, status: "updated" });
+  });
 
-    queueDb([
-      [],                                                                // BEGIN
-      [proposalRow({ milestone_breakdown: milestones })],               // SELECT proposal
-      [projectRow()],                                                    // SELECT project
-      [proposalRow({ status: 'accepted', accepted_at: new Date(), milestone_breakdown: milestones })], // UPDATE proposal
-      [],                                                                // reject others
-      [contractRow()],                                                   // INSERT contract
-      [],                                                                // UPDATE proposal.contract_id
-      [{                                                                 // INSERT milestone[0]
-        id: '00000000-0000-0000-0001-000000000001',
-        contract_id: TEST_CONTRACT_ID,
-        project_id: TEST_PROJECT_ID,
-        title: 'Design',
-        description: 'UI mockups',
-        amount: '200.000000',
-        currency: 'USDC',
-        due_date: null,
-        sort_order: 0,
-        status: 'pending',
-        created_at: new Date('2026-01-01'),
-      }],
-      [{                                                                 // INSERT milestone[1]
-        id: '00000000-0000-0000-0001-000000000002',
-        contract_id: TEST_CONTRACT_ID,
-        project_id: TEST_PROJECT_ID,
-        title: 'Dev',
-        description: 'Implementation',
-        amount: '300.000000',
-        currency: 'USDC',
-        due_date: null,
-        sort_order: 1,
-        status: 'pending',
-        created_at: new Date('2026-01-01'),
-      }],
-      [],                                                                // UPDATE project
-      [],                                                                // INSERT audit log
-      [],                                                                // COMMIT
-    ])
+  it("lets the project client accept a proposal", async () => {
+    queueSql([[client], [proposalRow({ status: "under_review" })], [proposalRow({ status: "accepted" })]]);
+    const res = await updateProposal(jsonRequest(proposalUrl, "PATCH", { status: "accepted" }), ctx(PROPOSAL_ID));
+    expect(res.status).toBe(200);
+    expect((await res.json()).data.status).toBe("accepted");
+  });
 
-    const req = makePostRequest(TEST_PROPOSAL_ID)
-    const res = await POST(req, routeCtx(TEST_PROPOSAL_ID))
-    expect(res.status).toBe(201)
-    const body = await res.json()
-    expect(body.milestones).toHaveLength(2)
-    expect(body.milestones[0].title).toBe('Design')
-    expect(body.milestones[0].amount).toBe(200)
-    expect(body.milestones[1].title).toBe('Dev')
-    expect(body.milestones[1].sortOrder).toBe(1)
-  })
+  it("blocks invalid status transitions", async () => {
+    queueSql([[client], [proposalRow({ status: "rejected" })]]);
+    const res = await updateProposal(jsonRequest(proposalUrl, "PATCH", { status: "accepted" }), ctx(PROPOSAL_ID));
+    expect(res.status).toBe(409);
+    expect((await res.json()).errors[0].code).toBe("INVALID_STATUS_TRANSITION");
+  });
 
-  // ── Domain error propagation ────────────────────────────────────────────
+  it("does not let the freelancer change the status", async () => {
+    queueSql([[freelancer], [proposalRow()]]);
+    const res = await updateProposal(jsonRequest(proposalUrl, "PATCH", { status: "accepted" }), ctx(PROPOSAL_ID));
+    expect(res.status).toBe(403);
+  });
 
-  it('returns 404 when proposal does not exist', async () => {
-    queueSql([[{ id: TEST_CLIENT_ID, role: 'client' }]])
-    queueDb([
-      [],  // BEGIN
-      [],  // SELECT proposal → not found (empty array)
-      [],  // ROLLBACK
-    ])
-    const req = makePostRequest(TEST_PROPOSAL_ID)
-    const res = await POST(req, routeCtx(TEST_PROPOSAL_ID))
-    expect(res.status).toBe(404)
-    const body = await res.json()
-    expect(body.code).toBe('PROPOSAL_NOT_FOUND')
-  })
+  it("rejects mixing status and content in one request", async () => {
+    const res = await updateProposal(
+      jsonRequest(proposalUrl, "PATCH", { status: "accepted", budget: 10 }),
+      ctx(PROPOSAL_ID),
+    );
+    expect(res.status).toBe(422);
+  });
+});
 
-  it('returns 409 when proposal is already accepted', async () => {
-    queueSql([[{ id: TEST_CLIENT_ID, role: 'client' }]])
-    queueDb([
-      [],
-      [proposalRow({ status: 'accepted' })],
-      [],  // ROLLBACK
-    ])
-    const req = makePostRequest(TEST_PROPOSAL_ID)
-    const res = await POST(req, routeCtx(TEST_PROPOSAL_ID))
-    expect(res.status).toBe(409)
-    const body = await res.json()
-    expect(body.code).toBe('PROPOSAL_ALREADY_ACCEPTED')
-  })
+describe("DELETE /api/proposals/[id]", () => {
+  it("returns 400 for a malformed id", async () => {
+    const res = await deleteProposal(jsonRequest("http://localhost/api/proposals/abc", "DELETE"), ctx("abc"));
+    expect(res.status).toBe(400);
+  });
 
-  it('returns 409 when proposal is rejected (not pending)', async () => {
-    queueSql([[{ id: TEST_CLIENT_ID, role: 'client' }]])
-    queueDb([
-      [],
-      [proposalRow({ status: 'rejected' })],
-      [],  // ROLLBACK
-    ])
-    const req = makePostRequest(TEST_PROPOSAL_ID)
-    const res = await POST(req, routeCtx(TEST_PROPOSAL_ID))
-    expect(res.status).toBe(409)
-    const body = await res.json()
-    expect(body.code).toBe('PROPOSAL_NOT_PENDING')
-  })
+  it("returns 403 for anyone but the creating freelancer", async () => {
+    queueSql([[client], [proposalRow()]]);
+    const res = await deleteProposal(jsonRequest(proposalUrl, "DELETE"), ctx(PROPOSAL_ID));
+    expect(res.status).toBe(403);
+  });
 
-  it('returns 409 when project is in a non-acceptable state (completed)', async () => {
-    queueSql([[{ id: TEST_CLIENT_ID, role: 'client' }]])
-    queueDb([
-      [],
-      [proposalRow()],
-      [projectRow({ status: 'completed' })],
-      [],  // ROLLBACK
-    ])
-    const req = makePostRequest(TEST_PROPOSAL_ID)
-    const res = await POST(req, routeCtx(TEST_PROPOSAL_ID))
-    expect(res.status).toBe(409)
-    const body = await res.json()
-    expect(body.code).toBe('PROJECT_NOT_ACTIVE')
-  })
+  it("refuses to delete an accepted proposal", async () => {
+    queueSql([[freelancer], [proposalRow({ status: "accepted" })]]);
+    const res = await deleteProposal(jsonRequest(proposalUrl, "DELETE"), ctx(PROPOSAL_ID));
+    expect(res.status).toBe(409);
+  });
 
-  it('returns 403 when caller is not the project client', async () => {
-    queueSql([[{ id: TEST_CLIENT_ID, role: 'client' }]])
-    queueDb([
-      [],
-      [proposalRow()],
-      [projectRow({ client_id: 'different-client-id' })],
-      [],  // ROLLBACK
-    ])
-    const req = makePostRequest(TEST_PROPOSAL_ID)
-    const res = await POST(req, routeCtx(TEST_PROPOSAL_ID))
-    expect(res.status).toBe(403)
-    const body = await res.json()
-    expect(body.code).toBe('FORBIDDEN')
-  })
-
-  it('returns 409 on DB unique constraint violation (concurrent acceptance race)', async () => {
-    queueSql([[{ id: TEST_CLIENT_ID, role: 'client' }]])
-    queueDb([
-      [],
-      [proposalRow()],
-      [projectRow()],
-      [proposalRow({ status: 'accepted', accepted_at: new Date() })],
-      [],
-      // DB raises unique violation on uq_proposals_one_accepted_per_project
-      Object.assign(
-        new Error('duplicate key value violates unique constraint "uq_proposals_one_accepted_per_project"'),
-        {},
-      ),
-      [],  // ROLLBACK
-    ])
-    const req = makePostRequest(TEST_PROPOSAL_ID)
-    const res = await POST(req, routeCtx(TEST_PROPOSAL_ID))
-    expect(res.status).toBe(409)
-    const body = await res.json()
-    expect(body.code).toBe('PROJECT_ALREADY_HAS_ACCEPTED_PROPOSAL')
-  })
-
-  it('returns 500 on unexpected server error', async () => {
-    queueSql([[{ id: TEST_CLIENT_ID, role: 'client' }]])
-    queueDb([
-      [],
-      [proposalRow()],
-      [projectRow()],
-      [proposalRow({ status: 'accepted', accepted_at: new Date() })],
-      [],
-      Object.assign(new Error('connection reset'), {}),
-      [],  // ROLLBACK
-    ])
-    const req = makePostRequest(TEST_PROPOSAL_ID)
-    const res = await POST(req, routeCtx(TEST_PROPOSAL_ID))
-    expect(res.status).toBe(500)
-    const body = await res.json()
-    expect(body.code).toBe('SERVER_ERROR')
-  })
-
-  // ── Admin access ────────────────────────────────────────────────────────
-
-  it('allows admin role to accept a proposal', async () => {
-    queueSql([[{ id: TEST_CLIENT_ID, role: 'admin' }]])
-    queueDb([
-      [],
-      [proposalRow()],
-      [projectRow()],
-      [proposalRow({ status: 'accepted', accepted_at: new Date() })],
-      [],
-      [contractRow()],
-      [],
-      [],
-      [],
-      [],
-    ])
-    const req = makePostRequest(TEST_PROPOSAL_ID)
-    const res = await POST(req, routeCtx(TEST_PROPOSAL_ID))
-    expect(res.status).toBe(201)
-  })
-})
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Service layer tests — lib/proposals.ts
-// ═══════════════════════════════════════════════════════════════════════════
-
-describe('getProposalById', () => {
-  it('returns null when no proposal exists', async () => {
-    dbMock.mockResolvedValueOnce([])   // SELECT * FROM proposals → empty
-    const result = await getProposalById(TEST_PROPOSAL_ID)
-    expect(result).toBeNull()
-  })
-
-  it('maps a DB row to a Proposal object', async () => {
-    dbMock.mockResolvedValueOnce([proposalRow()])
-    const result = await getProposalById(TEST_PROPOSAL_ID)
-    expect(result).not.toBeNull()
-    expect(result!.id).toBe(TEST_PROPOSAL_ID)
-    expect(result!.projectId).toBe(TEST_PROJECT_ID)
-    expect(result!.freelancerId).toBe(TEST_FREELANCER_ID)
-    expect(result!.status).toBe('pending')
-    expect(result!.proposedAmount).toBe(500)
-    expect(result!.milestoneBreakdown).toEqual([])
-  })
-})
-
-describe('acceptProposal', () => {
-  it('throws ProposalNotFoundError when proposal does not exist', async () => {
-    queueDb([
-      [],  // BEGIN
-      [],  // SELECT proposal → empty
-      [],  // ROLLBACK
-    ])
-    await expect(acceptProposal(TEST_PROPOSAL_ID, TEST_CLIENT_ID)).rejects.toThrow(
-      ProposalNotFoundError,
-    )
-  })
-
-  it('throws ProposalAlreadyAcceptedError for already-accepted proposals', async () => {
-    queueDb([
-      [],
-      [proposalRow({ status: 'accepted' })],
-      [],  // ROLLBACK
-    ])
-    await expect(acceptProposal(TEST_PROPOSAL_ID, TEST_CLIENT_ID)).rejects.toThrow(
-      ProposalAlreadyAcceptedError,
-    )
-  })
-
-  it('throws ProposalNotPendingError for rejected proposals', async () => {
-    queueDb([
-      [],
-      [proposalRow({ status: 'rejected' })],
-      [],  // ROLLBACK
-    ])
-    await expect(acceptProposal(TEST_PROPOSAL_ID, TEST_CLIENT_ID)).rejects.toThrow(
-      ProposalNotPendingError,
-    )
-  })
-
-  it('throws ProposalNotPendingError for withdrawn proposals', async () => {
-    queueDb([
-      [],
-      [proposalRow({ status: 'withdrawn' })],
-      [],  // ROLLBACK
-    ])
-    await expect(acceptProposal(TEST_PROPOSAL_ID, TEST_CLIENT_ID)).rejects.toThrow(
-      ProposalNotPendingError,
-    )
-  })
-
-  it('throws UnauthorizedAcceptanceError when caller is not the project client', async () => {
-    queueDb([
-      [],
-      [proposalRow()],
-      [projectRow({ client_id: 'someone-else-uuid' })],
-      [],  // ROLLBACK
-    ])
-    await expect(acceptProposal(TEST_PROPOSAL_ID, TEST_CLIENT_ID)).rejects.toThrow(
-      UnauthorizedAcceptanceError,
-    )
-  })
-
-  it('throws ProjectNotActiveError for a cancelled project', async () => {
-    queueDb([
-      [],
-      [proposalRow()],
-      [projectRow({ client_id: TEST_CLIENT_ID, status: 'cancelled' })],
-      [],  // ROLLBACK
-    ])
-    await expect(acceptProposal(TEST_PROPOSAL_ID, TEST_CLIENT_ID)).rejects.toThrow(
-      ProjectNotActiveError,
-    )
-  })
-
-  it('throws ProjectNotActiveError for a completed project', async () => {
-    queueDb([
-      [],
-      [proposalRow()],
-      [projectRow({ client_id: TEST_CLIENT_ID, status: 'completed' })],
-      [],  // ROLLBACK
-    ])
-    await expect(acceptProposal(TEST_PROPOSAL_ID, TEST_CLIENT_ID)).rejects.toThrow(
-      ProjectNotActiveError,
-    )
-  })
-
-  it('rolls back and rethrows on unexpected DB error during contract insert', async () => {
-    const boom = new Error('DB down')
-    queueDb([
-      [],                 // BEGIN
-      [proposalRow()],    // SELECT proposal
-      [projectRow()],     // SELECT project
-      [proposalRow({ status: 'accepted', accepted_at: new Date() })],
-      [],                 // UPDATE other proposals
-      boom,               // INSERT contract → error
-      [],                 // ROLLBACK
-    ])
-    await expect(acceptProposal(TEST_PROPOSAL_ID, TEST_CLIENT_ID)).rejects.toThrow('DB down')
-  })
-
-  it('returns correct AcceptProposalResult shape on success (no milestones)', async () => {
-    queueDb([
-      [],                 // BEGIN
-      [proposalRow()],    // SELECT proposal
-      [projectRow()],     // SELECT project
-      [proposalRow({ status: 'accepted', accepted_at: new Date() })], // UPDATE proposal
-      [],                 // UPDATE other proposals (reject)
-      [contractRow()],    // INSERT contract
-      [],                 // UPDATE proposal.contract_id
-      // no milestone iterations — empty array
-      [],                 // UPDATE project status
-      [],                 // INSERT audit log
-      [],                 // COMMIT
-    ])
-
-    const result = await acceptProposal(TEST_PROPOSAL_ID, TEST_CLIENT_ID)
-
-    expect(result.proposal.id).toBe(TEST_PROPOSAL_ID)
-    expect(result.proposal.status).toBe('accepted')
-    expect(result.proposal.contractId).toBe(TEST_CONTRACT_ID)
-
-    expect(result.contract.id).toBe(TEST_CONTRACT_ID)
-    expect(result.contract.status).toBe('pending')
-    expect(result.contract.escrowStatus).toBe('unfunded')
-    expect(result.contract.proposalId).toBe(TEST_PROPOSAL_ID)
-    expect(result.contract.totalAmount).toBe(500)
-
-    expect(result.milestones).toHaveLength(0)
-  })
-
-  it('creates milestone rows matching the breakdown and returns them', async () => {
-    const breakdown = [
-      { title: 'Phase 1', amount: 200 },
-      { title: 'Phase 2', amount: 300 },
-    ]
-
-    queueDb([
-      [],                                                          // BEGIN
-      [proposalRow({ milestone_breakdown: breakdown })],           // SELECT proposal
-      [projectRow()],                                              // SELECT project
-      [proposalRow({ status: 'accepted', accepted_at: new Date(), milestone_breakdown: breakdown })],
-      [],                                                          // reject others
-      [contractRow()],                                             // INSERT contract
-      [],                                                          // UPDATE proposal.contract_id
-      [{                                                           // INSERT milestone[0]
-        id: '00000000-0000-0000-0001-000000000001',
-        contract_id: TEST_CONTRACT_ID,
-        project_id: TEST_PROJECT_ID,
-        title: 'Phase 1',
-        description: null,
-        amount: '200.000000',
-        currency: 'USDC',
-        due_date: null,
-        sort_order: 0,
-        status: 'pending',
-        created_at: new Date(),
-      }],
-      [{                                                           // INSERT milestone[1]
-        id: '00000000-0000-0000-0001-000000000002',
-        contract_id: TEST_CONTRACT_ID,
-        project_id: TEST_PROJECT_ID,
-        title: 'Phase 2',
-        description: null,
-        amount: '300.000000',
-        currency: 'USDC',
-        due_date: null,
-        sort_order: 1,
-        status: 'pending',
-        created_at: new Date(),
-      }],
-      [],                                                          // UPDATE project
-      [],                                                          // INSERT audit log
-      [],                                                          // COMMIT
-    ])
-
-    const result = await acceptProposal(TEST_PROPOSAL_ID, TEST_CLIENT_ID)
-
-    expect(result.milestones).toHaveLength(2)
-    expect(result.milestones[0].title).toBe('Phase 1')
-    expect(result.milestones[0].amount).toBe(200)
-    expect(result.milestones[0].sortOrder).toBe(0)
-    expect(result.milestones[0].status).toBe('pending')
-    expect(result.milestones[1].title).toBe('Phase 2')
-    expect(result.milestones[1].sortOrder).toBe(1)
-  })
-
-  it('initializes escrow status to unfunded on contract creation', async () => {
-    queueDb([
-      [],
-      [proposalRow()],
-      [projectRow()],
-      [proposalRow({ status: 'accepted', accepted_at: new Date() })],
-      [],
-      [contractRow({ escrow_status: 'unfunded' })],
-      [],
-      [],
-      [],
-      [],
-    ])
-
-    const result = await acceptProposal(TEST_PROPOSAL_ID, TEST_CLIENT_ID)
-    expect(result.contract.escrowStatus).toBe('unfunded')
-  })
-
-  it('sets contract status to pending until escrow is funded', async () => {
-    queueDb([
-      [],
-      [proposalRow()],
-      [projectRow()],
-      [proposalRow({ status: 'accepted', accepted_at: new Date() })],
-      [],
-      [contractRow({ status: 'pending' })],
-      [],
-      [],
-      [],
-      [],
-    ])
-
-    const result = await acceptProposal(TEST_PROPOSAL_ID, TEST_CLIENT_ID)
-    expect(result.contract.status).toBe('pending')
-  })
-})
+  it("deletes the owner's proposal", async () => {
+    queueSql([[freelancer], [proposalRow()], [{ id: PROPOSAL_ID }]]);
+    const res = await deleteProposal(jsonRequest(proposalUrl, "DELETE"), ctx(PROPOSAL_ID));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      success: true,
+      data: { id: PROPOSAL_ID, deleted: true },
+      errors: null,
+    });
+  });
+});

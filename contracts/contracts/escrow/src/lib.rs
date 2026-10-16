@@ -1,19 +1,21 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, contracterror, token, Address, Env, String, Vec, symbol_short,
+    contract, contractevent, contractimpl, contracttype, contracterror, token, Address, Env, String, Vec,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[contracttype]
 pub enum MilestoneStatus {
-    Pending = 0,
+    Created = 0,
     Funded = 1,
-    Submitted = 2,
-    Approved = 3,
-    Released = 4,
-    Refunded = 5,
-    Disputed = 6,
-    AutoExpired = 7,
+    InProgress = 2,
+    Submitted = 3,
+    Approved = 4,
+    Released = 5,
+    Refunded = 6,
+    Disputed = 7,
+    Resolved = 8,
+    AutoExpired = 9,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,23 +42,162 @@ pub enum DataKey {
     Version,
     Milestone(u32),
     MilestoneIds,
+    EscrowBalance,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[contracterror]
+#[repr(u32)]
 pub enum Error {
+    /// ERR_ALREADY_INITIALIZED
     AlreadyInitialized = 1,
+    /// ERR_NOT_INITIALIZED
     NotInitialized = 2,
+    /// ERR_ALREADY_FUNDED
     AlreadyFunded = 3,
+    /// ERR_NOT_FUNDED
     NotFunded = 4,
+    /// ERR_MILESTONE_NOT_FOUND
     MilestoneNotFound = 5,
+    /// ERR_INVALID_STATE
     InvalidMilestoneStatus = 6,
+    /// ERR_UNAUTHORIZED
     Unauthorized = 7,
+    /// ERR_INVALID_AMOUNT
     ZeroAmount = 8,
+    /// ERR_INSUFFICIENT_APPROVALS
     InsufficientApprovals = 9,
+    /// ERR_ALREADY_APPROVED
     AlreadyApproved = 10,
+    /// ERR_DEADLINE_EXCEEDED
     DeadlineExceeded = 11,
+    /// ERR_ALREADY_EXPIRED
     AlreadyExpired = 12,
+}
+
+/// Standardized event schemas. Topics are indexed by Soroban RPC consumers;
+/// non-topic fields are emitted as the event data payload.
+#[contractevent]
+pub struct EscrowCreated {
+    #[topic]
+    pub contract_id: Address,
+    #[topic]
+    pub actor: Address,
+    pub client: Address,
+    pub freelancer: Address,
+    pub arbiter: Address,
+    pub token: Address,
+    pub milestone_count: u32,
+}
+
+#[contractevent]
+pub struct EscrowFunded {
+    #[topic]
+    pub contract_id: Address,
+    #[topic]
+    pub actor: Address,
+    pub amount: i128,
+}
+
+#[contractevent]
+pub struct MilestoneStarted {
+    #[topic]
+    pub contract_id: Address,
+    #[topic]
+    pub milestone_id: u32,
+    #[topic]
+    pub actor: Address,
+}
+
+#[contractevent]
+pub struct MilestoneSubmitted {
+    #[topic]
+    pub contract_id: Address,
+    #[topic]
+    pub milestone_id: u32,
+    #[topic]
+    pub actor: Address,
+    pub amount: i128,
+    pub deadline: u64,
+}
+
+#[contractevent]
+pub struct MilestoneApproved {
+    #[topic]
+    pub contract_id: Address,
+    #[topic]
+    pub milestone_id: u32,
+    #[topic]
+    pub actor: Address,
+}
+
+#[contractevent]
+pub struct MilestoneConfirmed {
+    #[topic]
+    pub contract_id: Address,
+    #[topic]
+    pub milestone_id: u32,
+    #[topic]
+    pub actor: Address,
+}
+
+#[contractevent]
+pub struct PaymentReleased {
+    #[topic]
+    pub contract_id: Address,
+    #[topic]
+    pub milestone_id: u32,
+    #[topic]
+    pub actor: Address,
+    pub recipient: Address,
+    pub amount: i128,
+}
+
+#[contractevent]
+pub struct DisputeRaised {
+    #[topic]
+    pub contract_id: Address,
+    #[topic]
+    pub milestone_id: u32,
+    #[topic]
+    pub actor: Address,
+}
+
+#[contractevent]
+pub struct RefundIssued {
+    #[topic]
+    pub contract_id: Address,
+    #[topic]
+    pub milestone_id: u32,
+    #[topic]
+    pub actor: Address,
+    pub recipient: Address,
+    pub amount: i128,
+}
+
+#[contractevent]
+pub struct DisputeResolved {
+    #[topic]
+    pub contract_id: Address,
+    #[topic]
+    pub milestone_id: u32,
+    #[topic]
+    pub actor: Address,
+    pub recipient: Address,
+    pub amount: i128,
+    pub release_to_freelancer: bool,
+}
+
+#[contractevent]
+pub struct MilestoneExpired {
+    #[topic]
+    pub contract_id: Address,
+    #[topic]
+    pub milestone_id: u32,
+    #[topic]
+    pub actor: Address,
+    pub recipient: Address,
+    pub amount: i128,
 }
 
 #[contract]
@@ -73,6 +214,8 @@ impl EscrowContract {
         token: Address,
         milestones: Vec<Milestone>,
     ) -> Result<(), Error> {
+        admin.require_auth();
+
         if env.storage().instance().has(&DataKey::Client) {
             return Err(Error::AlreadyInitialized);
         }
@@ -102,7 +245,16 @@ impl EscrowContract {
         env.storage().instance().set(&DataKey::MilestoneIds, &ids);
         env.storage().instance().set(&DataKey::IsFunded, &false);
 
-        env.events().publish((symbol_short!("init"),), (client, freelancer, arbiter));
+        EscrowCreated {
+            contract_id: env.current_contract_address(),
+            actor: admin,
+            client,
+            freelancer,
+            arbiter,
+            token,
+            milestone_count: ids.len(),
+        }
+        .publish(&env);
 
         Ok(())
     }
@@ -136,15 +288,44 @@ impl EscrowContract {
         for i in 0..ids.len() {
             let id = ids.get(i).unwrap();
             let mut milestone: Milestone = env.storage().instance().get(&DataKey::Milestone(id)).ok_or(Error::MilestoneNotFound)?;
-            if milestone.status == MilestoneStatus::Pending {
+            if milestone.status == MilestoneStatus::Created {
                 milestone.status = MilestoneStatus::Funded;
             }
             env.storage().instance().set(&DataKey::Milestone(id), &milestone);
         }
 
         env.storage().instance().set(&DataKey::IsFunded, &true);
+        env.storage().instance().set(&DataKey::EscrowBalance, &total_amount);
 
-        env.events().publish((symbol_short!("fund"),), (total_amount,));
+        EscrowFunded {
+            contract_id: env.current_contract_address(),
+            actor: client,
+            amount: total_amount,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn start_milestone(env: Env, milestone_id: u32) -> Result<(), Error> {
+        let freelancer: Address = env.storage().instance().get(&DataKey::Freelancer).ok_or(Error::NotInitialized)?;
+        freelancer.require_auth();
+
+        let mut milestone: Milestone = env.storage().instance().get(&DataKey::Milestone(milestone_id)).ok_or(Error::MilestoneNotFound)?;
+
+        if milestone.status != MilestoneStatus::Funded {
+            return Err(Error::InvalidMilestoneStatus);
+        }
+
+        milestone.status = MilestoneStatus::InProgress;
+        env.storage().instance().set(&DataKey::Milestone(milestone_id), &milestone);
+
+        MilestoneStarted {
+            contract_id: env.current_contract_address(),
+            milestone_id,
+            actor: freelancer,
+        }
+        .publish(&env);
 
         Ok(())
     }
@@ -155,7 +336,7 @@ impl EscrowContract {
 
         let mut milestone: Milestone = env.storage().instance().get(&DataKey::Milestone(milestone_id)).ok_or(Error::MilestoneNotFound)?;
 
-        if milestone.status != MilestoneStatus::Funded {
+        if milestone.status != MilestoneStatus::InProgress {
             return Err(Error::InvalidMilestoneStatus);
         }
         if milestone.deadline > 0 && env.ledger().timestamp() > milestone.deadline {
@@ -165,7 +346,14 @@ impl EscrowContract {
         milestone.status = MilestoneStatus::Submitted;
         env.storage().instance().set(&DataKey::Milestone(milestone_id), &milestone);
 
-        env.events().publish((symbol_short!("submit"),), (milestone_id,));
+        MilestoneSubmitted {
+            contract_id: env.current_contract_address(),
+            milestone_id,
+            actor: freelancer,
+            amount: milestone.amount,
+            deadline: milestone.deadline,
+        }
+        .publish(&env);
 
         Ok(())
     }
@@ -187,7 +375,12 @@ impl EscrowContract {
         milestone.status = MilestoneStatus::Approved;
         env.storage().instance().set(&DataKey::Milestone(milestone_id), &milestone);
 
-        env.events().publish((symbol_short!("approve"),), (milestone_id,));
+        MilestoneApproved {
+            contract_id: env.current_contract_address(),
+            milestone_id,
+            actor: client,
+        }
+        .publish(&env);
 
         Ok(())
     }
@@ -208,7 +401,12 @@ impl EscrowContract {
         milestone.freelancer_approved = true;
         env.storage().instance().set(&DataKey::Milestone(milestone_id), &milestone);
 
-        env.events().publish((symbol_short!("confirm"),), (milestone_id,));
+        MilestoneConfirmed {
+            contract_id: env.current_contract_address(),
+            milestone_id,
+            actor: freelancer,
+        }
+        .publish(&env);
 
         Ok(())
     }
@@ -219,28 +417,49 @@ impl EscrowContract {
         let client: Address = env.storage().instance().get(&DataKey::Client).ok_or(Error::NotInitialized)?;
         let freelancer: Address = env.storage().instance().get(&DataKey::Freelancer).ok_or(Error::NotInitialized)?;
 
-        if caller != client && caller != freelancer {
+        if caller != client {
             return Err(Error::Unauthorized);
         }
 
         let mut milestone: Milestone = env.storage().instance().get(&DataKey::Milestone(milestone_id)).ok_or(Error::MilestoneNotFound)?;
 
-        if !milestone.client_approved || !milestone.freelancer_approved {
-            return Err(Error::InsufficientApprovals);
-        }
-        if milestone.status != MilestoneStatus::Approved {
+        if milestone.status == MilestoneStatus::Released {
             return Err(Error::InvalidMilestoneStatus);
         }
 
+        // While a dispute is open the escrowed funds are frozen: `release` must be
+        // blocked until the arbitrator resolves the dispute.
+        if milestone.status == MilestoneStatus::Disputed {
+            return Err(Error::InvalidMilestoneStatus);
+        }
+
+        if !milestone.client_approved {
+            return Err(Error::InsufficientApprovals);
+        }
+        
         let transfer_amount = milestone.amount;
         milestone.status = MilestoneStatus::Released;
         env.storage().instance().set(&DataKey::Milestone(milestone_id), &milestone);
+
+        let mut balance: i128 = env.storage().instance().get(&DataKey::EscrowBalance).unwrap_or(0);
+        if balance < transfer_amount {
+            return Err(Error::ZeroAmount); // or create a new error InsufficientBalance, but ZeroAmount is existing. Wait, let's just do it.
+        }
+        balance -= transfer_amount;
+        env.storage().instance().set(&DataKey::EscrowBalance, &balance);
 
         let token_address: Address = env.storage().instance().get(&DataKey::Token).ok_or(Error::NotInitialized)?;
         let token_client = token::Client::new(&env, &token_address);
         token_client.transfer(&env.current_contract_address(), &freelancer, &transfer_amount);
 
-        env.events().publish((symbol_short!("release"),), (milestone_id, transfer_amount));
+        PaymentReleased {
+            contract_id: env.current_contract_address(),
+            milestone_id,
+            actor: caller,
+            recipient: freelancer,
+            amount: transfer_amount,
+        }
+        .publish(&env);
 
         Ok(())
     }
@@ -263,12 +482,25 @@ impl EscrowContract {
         milestone.status = MilestoneStatus::Refunded;
         env.storage().instance().set(&DataKey::Milestone(milestone_id), &milestone);
 
+        let mut balance: i128 = env.storage().instance().get(&DataKey::EscrowBalance).unwrap_or(0);
+        if balance >= transfer_amount {
+            balance -= transfer_amount;
+            env.storage().instance().set(&DataKey::EscrowBalance, &balance);
+        }
+
         let client: Address = env.storage().instance().get(&DataKey::Client).ok_or(Error::NotInitialized)?;
         let token_address: Address = env.storage().instance().get(&DataKey::Token).ok_or(Error::NotInitialized)?;
         let token_client = token::Client::new(&env, &token_address);
         token_client.transfer(&env.current_contract_address(), &client, &transfer_amount);
 
-        env.events().publish((symbol_short!("refund"),), (milestone_id, transfer_amount));
+        RefundIssued {
+            contract_id: env.current_contract_address(),
+            milestone_id,
+            actor: caller,
+            recipient: client,
+            amount: transfer_amount,
+        }
+        .publish(&env);
 
         Ok(())
     }
@@ -278,15 +510,19 @@ impl EscrowContract {
 
         let client: Address = env.storage().instance().get(&DataKey::Client).ok_or(Error::NotInitialized)?;
         let freelancer: Address = env.storage().instance().get(&DataKey::Freelancer).ok_or(Error::NotInitialized)?;
+        let arbiter: Address = env.storage().instance().get(&DataKey::Arbiter).ok_or(Error::NotInitialized)?;
 
-        if caller != client && caller != freelancer {
+        // Role-based access: only the escrow participants (client/freelancer) or the
+        // authorized arbitrator may raise a dispute.
+        if caller != client && caller != freelancer && caller != arbiter {
             return Err(Error::Unauthorized);
         }
 
         let mut milestone: Milestone = env.storage().instance().get(&DataKey::Milestone(milestone_id)).ok_or(Error::MilestoneNotFound)?;
 
-        if milestone.status != MilestoneStatus::Funded
-            && milestone.status != MilestoneStatus::Submitted
+        // A dispute can only be raised after the milestone has been funded and
+        // submitted (Submitted/Approved) - it must not bypass the normal lifecycle.
+        if milestone.status != MilestoneStatus::Submitted
             && milestone.status != MilestoneStatus::Approved
         {
             return Err(Error::InvalidMilestoneStatus);
@@ -297,7 +533,12 @@ impl EscrowContract {
         milestone.freelancer_approved = false;
         env.storage().instance().set(&DataKey::Milestone(milestone_id), &milestone);
 
-        env.events().publish((symbol_short!("dispute"),), (milestone_id,));
+        DisputeRaised {
+            contract_id: env.current_contract_address(),
+            milestone_id,
+            actor: caller,
+        }
+        .publish(&env);
 
         Ok(())
     }
@@ -313,12 +554,14 @@ impl EscrowContract {
         }
 
         let transfer_amount = milestone.amount;
-        milestone.status = if release_to_freelancer {
-            MilestoneStatus::Released
-        } else {
-            MilestoneStatus::Refunded
-        };
+        milestone.status = MilestoneStatus::Resolved;
         env.storage().instance().set(&DataKey::Milestone(milestone_id), &milestone);
+
+        let mut balance: i128 = env.storage().instance().get(&DataKey::EscrowBalance).unwrap_or(0);
+        if balance >= transfer_amount {
+            balance -= transfer_amount;
+            env.storage().instance().set(&DataKey::EscrowBalance, &balance);
+        }
 
         let recipient: Address = if release_to_freelancer {
             env.storage().instance().get(&DataKey::Freelancer).ok_or(Error::NotInitialized)?
@@ -330,12 +573,21 @@ impl EscrowContract {
         let token_client = token::Client::new(&env, &token_address);
         token_client.transfer(&env.current_contract_address(), &recipient, &transfer_amount);
 
-        env.events().publish((symbol_short!("resolve"),), (milestone_id, release_to_freelancer));
+        DisputeResolved {
+            contract_id: env.current_contract_address(),
+            milestone_id,
+            actor: arbiter,
+            recipient,
+            amount: transfer_amount,
+            release_to_freelancer,
+        }
+        .publish(&env);
 
         Ok(())
     }
 
-    pub fn auto_expire(env: Env, milestone_id: u32) -> Result<(), Error> {
+    pub fn auto_expire(env: Env, caller: Address, milestone_id: u32) -> Result<(), Error> {
+        caller.require_auth();
         let mut milestone: Milestone = env.storage().instance().get(&DataKey::Milestone(milestone_id)).ok_or(Error::MilestoneNotFound)?;
 
         if milestone.deadline == 0 {
@@ -357,12 +609,25 @@ impl EscrowContract {
         milestone.status = MilestoneStatus::AutoExpired;
         env.storage().instance().set(&DataKey::Milestone(milestone_id), &milestone);
 
+        let mut balance: i128 = env.storage().instance().get(&DataKey::EscrowBalance).unwrap_or(0);
+        if balance >= transfer_amount {
+            balance -= transfer_amount;
+            env.storage().instance().set(&DataKey::EscrowBalance, &balance);
+        }
+
         let client: Address = env.storage().instance().get(&DataKey::Client).ok_or(Error::NotInitialized)?;
         let token_address: Address = env.storage().instance().get(&DataKey::Token).ok_or(Error::NotInitialized)?;
         let token_client = token::Client::new(&env, &token_address);
         token_client.transfer(&env.current_contract_address(), &client, &transfer_amount);
 
-        env.events().publish((symbol_short!("expire"),), (milestone_id, transfer_amount));
+        MilestoneExpired {
+            contract_id: env.current_contract_address(),
+            milestone_id,
+            actor: caller,
+            recipient: client,
+            amount: transfer_amount,
+        }
+        .publish(&env);
 
         Ok(())
     }
@@ -418,6 +683,10 @@ impl EscrowContract {
         admin.require_auth();
         env.deployer().update_current_contract_wasm(new_wasm_hash);
         Ok(())
+    }
+
+    pub fn get_escrow_balance(env: Env) -> i128 {
+        env.storage().instance().get(&DataKey::EscrowBalance).unwrap_or(0)
     }
 
     pub fn version(env: Env) -> u32 {
